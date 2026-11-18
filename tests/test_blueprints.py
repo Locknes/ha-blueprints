@@ -280,7 +280,7 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         )
         self.assertEqual(
             end["_rendered_notify"]["data"]["clickAction"],
-            "intent://ha.example.com/api/frigate/frigate/notifications/det-1/clip.mp4#Intent;scheme=https;action=android.intent.action.VIEW;type=video/mp4;end",
+            "https://ha.example.com/api/frigate/frigate/notifications/det-1/clip.mp4",
         )
         self.assertEqual(
             end["_rendered_notify"]["data"]["url"],
