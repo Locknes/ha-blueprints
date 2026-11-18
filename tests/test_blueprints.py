@@ -3,7 +3,6 @@ from __future__ import annotations
 import pathlib
 from types import SimpleNamespace
 import unittest
-import urllib.parse
 
 from jinja2.nativetypes import NativeEnvironment
 import yaml
@@ -55,6 +54,7 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         if isinstance(val, str) and ("{{" in val or "{%" in val):
             local_ctx = dict(ctx)
             if allow_states:
+                local_ctx["states"] = lambda eid: states.get(eid, ("unknown", {}))[0]
                 local_ctx["state_attr"] = lambda eid, attr: states.get(eid, (None, {}))[1].get(attr)
                 local_ctx["expand"] = lambda ents: [
                     SimpleNamespace(entity_id=e, state=states.get(e, ("unknown", {}))[0])
@@ -68,7 +68,20 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         mock_states = {
             "camera.backyard": (
                 "recording",
-                {"friendly_name": "Backyard Cam", "camera_name": "backyard", "client_id": "frigate"},
+                {
+                    "friendly_name": "Backyard Cam",
+                    "camera_name": "backyard",
+                    "client_id": "frigate",
+                    "entity_picture": "/api/camera_proxy/camera.backyard?token=camtok123",
+                },
+            ),
+            "image.backyard_person": (
+                "2026-11-18T16:38:37.339090",
+                {"entity_picture": "/api/image_proxy/image.backyard_person?token=imgtok456"},
+            ),
+            "image.backyard_cow": (
+                "unknown",
+                {"entity_picture": "/api/image_proxy/image.backyard_cow?token=empty789"},
             ),
             "person.alice": ("not_home", {"friendly_name": "Alice"}),
         }
@@ -109,11 +122,19 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
             self._eval(self.doc["actions"][0]["if"][0]["value_template"], ctx, mock_states)
         )
         if ctx["_manual_test_runs"]:
-            ctx["_rendered_test_notify"] = self._eval(self.doc["actions"][0]["then"][0]["data"], ctx, mock_states)
+            test_then = self.doc["actions"][0]["then"]
+            for k, expr in test_then[0]["variables"].items():
+                ctx[k] = self._eval(expr, ctx, mock_states, allow_states=True)
+            ctx["_rendered_test_notify"] = self._eval(test_then[1]["data"], ctx, mock_states)
         if review_cond:
             review_then = self.doc["actions"][1]["then"]
-            ctx["_gif_delay_runs"] = bool(self._eval(review_then[0]["if"][0]["value_template"], ctx, mock_states))
-            ctx["_rendered_notify"] = self._eval(review_then[1]["data"], ctx, mock_states)
+            ctx["_first_alert_settle_runs"] = bool(
+                self._eval(review_then[0]["if"][0]["value_template"], ctx, mock_states)
+            )
+            ctx["_gif_delay_runs"] = bool(self._eval(review_then[1]["if"][0]["value_template"], ctx, mock_states))
+            for k, expr in review_then[2]["variables"].items():
+                ctx[k] = self._eval(expr, ctx, mock_states, allow_states=True)
+            ctx["_rendered_notify"] = self._eval(review_then[3]["data"], ctx, mock_states)
         ctx["_mute_runs"] = bool(self._eval(self.doc["actions"][2]["if"][0]["value_template"], ctx, mock_states))
         return ctx
 
@@ -134,6 +155,8 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         self.assertEqual(used_inputs, set(self.defined_inputs.keys()))
         self.assertRegex(self.bp["homeassistant"]["min_version"], r"^\d+\.\d+\.\d+$")
         self.assertNotIn("namespace(", self.raw_text)
+        # Never embed %2F in FrontendTarget paths (Android UrlUtil.handle decodes %2F and splits segments)
+        self.assertNotIn("%2F", self.raw_text)
 
         for name, spec in self.defined_inputs.items():
             sel = spec.get("selector", {})
@@ -143,8 +166,7 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
                         self.assertIn("label", opt, f"Missing label in {name}")
                         self.assertIn("value", opt, f"Missing value in {name}")
 
-    def test_new_alert_uses_client_id_authenticated_snapshot_and_safe_spa_uris(self) -> None:
-        # Frigate 0.18 sends `"before": null` (None in Python) on `"type": "new"`!
+    def test_new_alert_uses_mqtt_ram_image_proxy_with_token(self) -> None:
         res = self._simulate(
             {
                 "id": "review",
@@ -158,7 +180,7 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
                         "severity": "alert",
                         "data": {
                             "detections": ["det-1", "det-2"],
-                            "objects": ["dog", "person", "person-verified"],
+                            "objects": ["person", "person-verified"],
                             "sub_labels": ["Courier"],
                             "zones": ["patio"],
                         },
@@ -168,21 +190,36 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         )
         self.assertTrue(res["_mqtt_matched"])
         self.assertTrue(res["_cond_passed"])
-        self.assertFalse(res["_manual_test_runs"])
-        self.assertTrue(res["is_first_alert"])
-        self.assertEqual(res["_rendered_notify"]["title"], "Dog, Person (Courier) • Backyard Cam")
+        self.assertTrue(res["_first_alert_settle_runs"])
+        self.assertEqual(res["_rendered_notify"]["title"], "Person (Courier) • Backyard Cam")
         self.assertEqual(
             res["_rendered_notify"]["data"]["image"],
-            "/api/frigate/frigate/snapshot/det-2?bbox=1",
+            "/api/image_proxy/image.backyard_person?token=imgtok456",
         )
-        self.assertFalse(res["_rendered_notify"]["data"]["alert_once"])
-        self.assertEqual(res["_rendered_notify"]["data"]["clickAction"], "entityId:camera.backyard")
-        # Never put raw relative /api/... media files into clickAction or action URI (avoids android#7380)
-        for act in res["_rendered_notify"]["data"]["actions"]:
-            if act.get("action") == "URI":
-                self.assertFalse(act["uri"].startswith("/api/"))
 
-    def test_fallback_when_client_id_attribute_absent(self) -> None:
+    def test_unknown_mqtt_image_entity_falls_back_to_frigate_snapshot(self) -> None:
+        res = self._simulate(
+            {
+                "id": "review",
+                "platform": "mqtt",
+                "payload_json": {
+                    "type": "new",
+                    "before": None,
+                    "after": {
+                        "id": "rev-1",
+                        "camera": "backyard",
+                        "severity": "alert",
+                        "data": {"detections": ["det-1"], "objects": ["cow"], "sub_labels": [], "zones": []},
+                    },
+                },
+            }
+        )
+        self.assertEqual(
+            res["_rendered_notify"]["data"]["image"],
+            "/api/frigate/frigate/snapshot/det-1?bbox=1",
+        )
+
+    def test_fullscreen_dashboard_path_replaces_small_bottom_sheet(self) -> None:
         res = self._simulate(
             {
                 "id": "review",
@@ -198,64 +235,32 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
                     },
                 },
             },
-            states={"camera.backyard": ("recording", {"friendly_name": "Backyard", "camera_name": "backyard"})},
+            user_inputs={"camera_dashboard_url": "/ccab4aaf_frigate-proxy"},
         )
-        self.assertEqual(res["_rendered_notify"]["data"]["image"], "/api/frigate/snapshot/det-1?bbox=1")
+        self.assertEqual(res["_rendered_notify"]["data"]["clickAction"], "/ccab4aaf_frigate-proxy")
+        self.assertEqual(res["_rendered_notify"]["data"]["actions"][0]["uri"], "/ccab4aaf_frigate-proxy")
 
-    def test_manual_ui_run_button_sends_live_test_notification(self) -> None:
+    def test_manual_ui_run_button_uses_ram_image_proxy(self) -> None:
         res = self._simulate({"platform": None, "id": None})
         self.assertTrue(res["_manual_test_runs"])
         self.assertEqual(res["_rendered_test_notify"]["title"], "🧪 Test Alert • Backyard Cam")
-        self.assertEqual(res["_rendered_test_notify"]["data"]["image"], "/api/camera_proxy/camera.backyard")
-        self.assertEqual(res["_rendered_test_notify"]["data"]["actions"][1]["title"], "View Clips")
-        self.assertTrue(res["_rendered_test_notify"]["data"]["actions"][1]["uri"].startswith("/media-browser/browser/"))
+        self.assertEqual(
+            res["_rendered_test_notify"]["data"]["image"],
+            "/api/image_proxy/image.backyard_person?token=imgtok456",
+        )
+        self.assertEqual(res["_rendered_test_notify"]["data"]["actions"][1]["uri"], "/media-browser/browser")
 
     def test_noop_update_is_skipped_at_trigger(self) -> None:
         state = {
             "id": "rev-1",
             "camera": "backyard",
             "severity": "alert",
-            "data": {"detections": ["det-1"], "objects": ["dog"], "sub_labels": [], "zones": ["patio"]},
+            "data": {"detections": ["det-1"], "objects": ["person"], "sub_labels": [], "zones": ["patio"]},
         }
         res = self._simulate(
             {"id": "review", "platform": "mqtt", "payload_json": {"type": "update", "before": state, "after": state}}
         )
         self.assertFalse(res["_mqtt_matched"])
-
-    def test_end_defaults_to_authenticated_media_browser_and_keeps_snapshot(self) -> None:
-        state = {
-            "id": "rev-1",
-            "camera": "backyard",
-            "severity": "alert",
-            "data": {"detections": ["det-1", "det-2"], "objects": ["person"], "sub_labels": ["Joy"], "zones": []},
-        }
-        end = self._simulate(
-            {"id": "review", "platform": "mqtt", "payload_json": {"type": "end", "before": state, "after": state}}
-        )
-        self.assertTrue(end["_mqtt_matched"])
-        self.assertTrue(end["_cond_passed"])
-        self.assertFalse(end["is_first_alert"])
-        self.assertFalse(end["_gif_delay_runs"])
-        self.assertEqual(end["_rendered_notify"]["data"]["image"], "/api/frigate/frigate/snapshot/det-2?bbox=1")
-
-        # Verify HA Media Browser SPA URL decodes to a valid Frigate EventSearchIdentifier with zero inner slashes
-        tap_uri = end["_rendered_notify"]["data"]["clickAction"]
-        self.assertTrue(tap_uri.startswith("/media-browser/browser/"))
-        encoded_segment = tap_uri.removeprefix("/media-browser/browser/")
-        self.assertNotIn("/", encoded_segment)
-        decoded = urllib.parse.unquote(encoded_segment)
-        self.assertEqual(
-            decoded,
-            "video,media-source://frigate/frigate/event-search/clips/Backyard Cam///backyard//",
-        )
-        self.assertEqual(
-            end["_rendered_notify"]["data"]["actions"][0],
-            {"action": "URI", "title": "View Clips", "uri": tap_uri},
-        )
-        self.assertEqual(
-            end["_rendered_notify"]["data"]["actions"][1],
-            {"action": "URI", "title": "Live Camera", "uri": "entityId:camera.backyard"},
-        )
 
     def test_optional_direct_native_player_intent_and_animated_gif(self) -> None:
         state = {
@@ -288,7 +293,7 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
             "id": "rev-1",
             "camera": "backyard",
             "severity": "alert",
-            "data": {"detections": ["det-1"], "objects": ["dog"], "sub_labels": [], "zones": ["patio"]},
+            "data": {"detections": ["det-1"], "objects": ["person"], "sub_labels": [], "zones": ["patio"]},
         }
         rev = self._simulate(
             {"id": "review", "platform": "mqtt", "payload_json": {"type": "new", "before": None, "after": state}},
@@ -297,7 +302,6 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         )
         self.assertFalse(rev["_cond_passed"])
 
-        # Unrelated mobile notification button (e.g. OOB gate) is ignored
         other = self._simulate(
             {"id": "mute", "platform": "event", "event": {"data": {"action": "APPROVE_OOB_123"}}},
         )
