@@ -133,37 +133,33 @@ blueprint:
 mode: single
 max_exceeded: silent
 
-trigger_variables:
-  camera_entity: !input camera
-  camera_slug: "{{ camera_entity.split('.')[-1] }}"
-  mute_action: "{{ 'FRIGATE_MUTE_' ~ camera_slug }}"
-  unmute_action: "{{ 'FRIGATE_UNMUTE_' ~ camera_slug }}"
-
 triggers:
   - id: review
     trigger: mqtt
     topic: frigate/reviews
-    payload: "match"
+    payload: !input camera
     value_template: >-
-      {% set a = value_json.get('after', {}) %}
-      {% set b = value_json.get('before', {}) %}
-      {% set a_data = a.get('data', {}) %}
-      {% set b_data = b.get('data', {}) %}
+      {% set a = value_json.get('after') or {} %}
+      {% set b = value_json.get('before') or {} %}
+      {% set a_data = a.get('data') or {} %}
+      {% set b_data = b.get('data') or {} %}
       {% set changed = value_json.get('type') in ['new', 'end']
          or b.get('severity') != a.get('severity')
          or b_data.get('objects') != a_data.get('objects')
          or b_data.get('sub_labels') != a_data.get('sub_labels')
          or b_data.get('zones') != a_data.get('zones')
          or (not b_data.get('detections') and a_data.get('detections')) %}
-      {{ 'match' if (a.get('camera') == camera_slug and changed) else 'skip' }}
+      {{ ('camera.' ~ a.get('camera', '')) if changed else '' }}
 
   - id: mute
     trigger: event
     event_type: mobile_app_notification_action
-    event_data:
-      action: "{{ mute_action }}"
 
 variables:
+  camera_entity: !input camera
+  camera_slug: "{{ camera_entity.split('.')[-1] }}"
+  mute_action: "{{ 'FRIGATE_MUTE_' ~ camera_slug }}"
+  unmute_action: "{{ 'FRIGATE_UNMUTE_' ~ camera_slug }}"
   raw_notify: !input notify_service
   severity_mode: !input severity_filter
   zone_only: !input zone_filter
@@ -243,8 +239,12 @@ variables:
 conditions:
   - condition: or
     conditions:
-      - condition: trigger
-        id: mute
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: mute
+          - condition: template
+            value_template: "{{ trigger.event is defined and trigger.event.data.get('action') == mute_action }}"
       - condition: and
         conditions:
           - condition: trigger
@@ -255,6 +255,37 @@ conditions:
             conditions: !input custom_conditions
 
 actions:
+  # 0. Manual "Run" button in Home Assistant UI -> sends a live test notification
+  - if:
+      - condition: template
+        value_template: "{{ trigger.platform is not defined or trigger.platform is none }}"
+    then:
+      - action: "{{ notify_action }}"
+        data:
+          title: "🧪 Test Alert • {{ camera_name }}"
+          message: "Test notification for {{ camera_name }}."
+          data:
+            tag: "frigate_test_{{ camera_slug }}"
+            channel: "Frigate: {{ camera_name }}"
+            group: "frigate_{{ camera_slug }}"
+            importance: high
+            priority: high
+            ttl: 0
+            notification_icon: "mdi:cctv"
+            color: "#3B82F6"
+            clickAction: "{{ live_url }}"
+            url: "{{ live_url }}"
+            image: "/api/camera_proxy/{{ camera_entity }}"
+            attachment:
+              url: "/api/camera_proxy/{{ camera_entity }}"
+            actions:
+              - action: URI
+                title: "Live Camera"
+                uri: "{{ live_url }}"
+              - action: "{{ mute_action }}"
+                title: "Mute {{ mute_minutes | int }}m"
+                destructive: true
+
   # 1. Send or silently update the Frigate detection notification
   - if:
       - condition: trigger
