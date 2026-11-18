@@ -3,8 +3,9 @@ blueprint:
   description: >-
     Clean, readable notification blueprint for **Frigate 0.14–0.18+** using `frigate/reviews`.
     Groups overlapping detections into one thread, updates silently in place without stuck
-    `wait_for_trigger` loops, upgrades to `View Clip` + animated GIF when finished, and supports
-    anytime camera muting with a live countdown timer.
+    `wait_for_trigger` loops, attaches authenticated `?bbox=1` snapshots via `client_id`,
+    opens clips inside Home Assistant's Media Browser SPA (avoiding Android WebView
+    `?external_auth=1` timeouts), and supports anytime camera muting with a live countdown.
   domain: automation
   author: Locknes
   source_url: https://github.com/Locknes/ha-blueprints/blob/main/blueprints/automation/frigate_review_notifications.yaml
@@ -123,10 +124,32 @@ blueprint:
               max: 720
               unit_of_measurement: minutes
 
+        camera_dashboard_url:
+          name: (Optional) Live Camera Dashboard Path
+          description: >-
+            Custom dashboard path for `Live Camera` (e.g., `/lovelace/cameras`). Leave blank to open
+            Home Assistant's native camera dialog (`entityId:camera.<name>`).
+          default: ""
+          selector:
+            text: {}
+
+        direct_clip_base_url:
+          name: (Optional) Direct Native Player Base URL
+          description: >-
+            Leave blank (recommended) to open clips inside Home Assistant's authenticated Frigate
+            Media Browser without Android `?external_auth=1` WebView errors. Or set your external HA
+            URL (e.g., `https://ha.example.com`, requires Frigate's notification proxy enabled) to
+            launch the MP4 directly in Android's native fullscreen video player (`intent://`).
+          default: ""
+          selector:
+            text: {}
+
         end_animated_preview:
           name: Animated GIF When Event Ends
-          description: Swap the static snapshot for Frigate's `review_preview.gif` once the event finishes.
-          default: true
+          description: >-
+            Swap the `?bbox=1` snapshot for `review_preview.gif` after a 3s settle delay when the
+            event finishes (requires Frigate's unauthenticated notification proxy enabled).
+          default: false
           selector:
             boolean: {}
 
@@ -158,6 +181,8 @@ triggers:
 variables:
   camera_entity: !input camera
   camera_slug: "{{ camera_entity.split('.')[-1] }}"
+  client_id: "{{ state_attr(camera_entity, 'client_id') or '' }}"
+  frigate_api: "{{ '/api/frigate/' ~ client_id if client_id else '/api/frigate' }}"
   mute_action: "{{ 'FRIGATE_MUTE_' ~ camera_slug }}"
   unmute_action: "{{ 'FRIGATE_UNMUTE_' ~ camera_slug }}"
   raw_notify: !input notify_service
@@ -168,13 +193,15 @@ variables:
   presence_entities: !input presence_filter
   cooldown_secs: !input cooldown
   mute_minutes: !input silence_timer
+  raw_dashboard: !input camera_dashboard_url
+  raw_base_url: !input direct_clip_base_url
   use_gif: !input end_animated_preview
 
   notify_action: "{{ raw_notify if '.' in raw_notify else 'notify.' ~ raw_notify }}"
   camera_name: "{{ state_attr(camera_entity, 'friendly_name') or (camera_slug | replace('_', ' ') | title) }}"
   anyone_home: "{{ expand(presence_entities) | selectattr('state', 'in', ['home', 'on']) | list | length > 0 }}"
 
-  # Safely unpack MQTT payload (defaults to empty dicts when triggered by the Mute button)
+  # Safely unpack MQTT payload (defaults to empty dicts when triggered by Mute or Manual Run)
   payload: "{{ trigger.payload_json if (trigger.id == 'review' and trigger.payload_json is defined) else {} }}"
   ev_type: "{{ payload.get('type', '') }}"
   is_ended: "{{ ev_type == 'end' }}"
@@ -182,6 +209,7 @@ variables:
   before: "{{ payload.get('before') or {} }}"
   after_data: "{{ after.get('data') or {} }}"
   before_data: "{{ before.get('data') or {} }}"
+  frigate_camera: "{{ after.get('camera') or state_attr(camera_entity, 'camera_name') or camera_slug }}"
 
   review_id: "{{ after.get('id', '') }}"
   detections: "{{ after_data.get('detections', []) }}"
@@ -230,10 +258,25 @@ variables:
   notif_icon: "{{ 'mdi:account-alert' if 'person' in objects else (icon_map.get(objects[0], 'mdi:paw') if objects else 'mdi:cctv') }}"
   notif_color: "{{ '#EF4444' if 'person' in objects else ('#F59E0B' if 'package' in objects else '#10B981') }}"
 
-  live_url: "entityId:{{ camera_entity }}"
-  snapshot_url: "/api/frigate/notifications/{{ latest_det_id }}/snapshot.jpg"
-  clip_url: "/api/frigate/notifications/{{ first_det_id }}/clip.mp4"
-  image_url: "{{ '/api/frigate/notifications/' ~ review_id ~ '/review_preview.gif' if (is_ended and use_gif) else snapshot_url }}"
+  # Authenticated SPA routes & client_id-scoped proxy URLs (avoids home-assistant/android#7380)
+  live_url: "{{ (raw_dashboard | trim) if (raw_dashboard | trim) else ('entityId:' ~ camera_entity) }}"
+  clips_browser_url: >-
+    /media-browser/browser/video%2Cmedia-source%3A%2F%2Ffrigate%2F{{ (client_id ~ '%2F') if client_id else '' }}event-search%2Fclips%2F{{ camera_name | urlencode | replace('/', '%2F') }}%2F%2F%2F{{ frigate_camera }}%2F%2F
+  clean_base: "{{ (raw_base_url | trim).rstrip('/') }}"
+  base_scheme: "{{ 'http' if clean_base.startswith('http://') else 'https' }}"
+  base_host: "{{ clean_base | replace('https://', '') | replace('http://', '') }}"
+  clip_path: "{{ frigate_api ~ '/notifications/' ~ first_det_id ~ '/clip.mp4' }}"
+  clip_action_title: "{{ 'Play Clip' if base_host else 'View Clips' }}"
+  android_clip_url: >-
+    {{ ('intent://' ~ base_host ~ clip_path ~ '#Intent;scheme=' ~ base_scheme ~ ';action=android.intent.action.VIEW;type=video/mp4;end')
+       if base_host else clips_browser_url }}
+  ios_clip_url: "{{ (clean_base ~ clip_path) if base_host else clips_browser_url }}"
+
+  # SnapshotsProxyView (/api/frigate/<client_id>/snapshot/<id>?bbox=1) uses Companion Bearer auth
+  # directly, working even when Frigate's unauthenticated notification proxy is disabled.
+  snapshot_url: "{{ frigate_api }}/snapshot/{{ latest_det_id }}?bbox=1"
+  gif_url: "{{ frigate_api }}/notifications/{{ review_id }}/review_preview.gif"
+  image_url: "{{ gif_url if (is_ended and use_gif) else snapshot_url }}"
   mute_tag: "frigate_mute_{{ camera_slug }}"
 
 conditions:
@@ -282,6 +325,9 @@ actions:
               - action: URI
                 title: "Live Camera"
                 uri: "{{ live_url }}"
+              - action: URI
+                title: "View Clips"
+                uri: "{{ clips_browser_url }}"
               - action: "{{ mute_action }}"
                 title: "Mute {{ mute_minutes | int }}m"
                 destructive: true
@@ -291,6 +337,13 @@ actions:
       - condition: trigger
         id: review
     then:
+      - if:
+          - condition: template
+            value_template: "{{ is_ended and use_gif }}"
+        then:
+          - delay:
+              seconds: 3
+
       - action: "{{ notify_action }}"
         data:
           title: "{{ notif_title }}"
@@ -305,8 +358,8 @@ actions:
             alert_once: "{{ not is_first_alert }}"
             notification_icon: "{{ notif_icon }}"
             color: "{{ notif_color }}"
-            clickAction: "{{ clip_url if is_ended else live_url }}"
-            url: "{{ clip_url if is_ended else live_url }}"
+            clickAction: "{{ android_clip_url if is_ended else live_url }}"
+            url: "{{ ios_clip_url if is_ended else live_url }}"
             image: "{{ image_url }}"
             attachment:
               url: "{{ image_url }}"
@@ -315,11 +368,11 @@ actions:
               interruption-level: "{{ 'time-sensitive' if is_first_alert else 'passive' }}"
             actions:
               - action: URI
-                title: "{{ 'View Clip' if is_ended else 'Live Camera' }}"
-                uri: "{{ clip_url if is_ended else live_url }}"
+                title: "{{ clip_action_title if is_ended else 'Live Camera' }}"
+                uri: "{{ android_clip_url if is_ended else live_url }}"
               - action: URI
-                title: "Snapshot"
-                uri: "{{ snapshot_url }}"
+                title: "{{ 'Live Camera' if is_ended else 'View Clips' }}"
+                uri: "{{ live_url if is_ended else clips_browser_url }}"
               - action: "{{ mute_action }}"
                 title: "Mute {{ mute_minutes | int }}m"
                 destructive: true
