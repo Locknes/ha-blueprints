@@ -1,0 +1,347 @@
+blueprint:
+  name: "Frigate Review Notification"
+  description: >-
+    Clean, readable notification blueprint for **Frigate 0.14–0.18+** using `frigate/reviews`.
+    Groups overlapping detections into one thread, updates silently in place without stuck
+    `wait_for_trigger` loops, upgrades to `View Clip` + animated GIF when finished, and supports
+    anytime camera muting with a live countdown timer.
+  domain: automation
+  author: Locknes
+  source_url: https://github.com/Locknes/ha-blueprints/blob/main/blueprints/automation/frigate_review_notifications.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+
+  input:
+    camera:
+      name: Frigate Camera
+      description: Frigate camera entity (e.g., `camera.backyard` or `camera.frontdoor`).
+      selector:
+        entity:
+          filter:
+            - domain: camera
+              integration: frigate
+
+    notify_service:
+      name: Notification Service or Group
+      description: Target `notify.*` service or group (e.g., `notify.mobile_app_pixel` or `notify.family`).
+      default: "notify.notify"
+      selector:
+        text: {}
+
+    severity_filter:
+      name: Review Severity
+      description: "`Alerts Only` uses Frigate's alert rules; `Alerts & Detections` includes all tracked objects."
+      default: "alert"
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: "Alerts Only (Recommended)"
+              value: "alert"
+            - label: "Alerts & Detections"
+              value: "all"
+
+    labels:
+      name: (Optional) Object / Sub-Label Filter
+      description: Leave empty for all objects, or filter to specific labels (automatically matches `-verified`).
+      default: []
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options:
+            - person
+            - car
+            - package
+            - dog
+            - cat
+            - bear
+            - deer
+            - fox
+            - coyote
+            - bird
+            - cow
+            - horse
+            - sheep
+
+    zone_filter:
+      name: Require Zone Entry
+      description: Only notify when the object has entered at least one Frigate zone.
+      default: false
+      selector:
+        boolean: {}
+
+    zones:
+      name: (Optional) Trigger Zones
+      description: Restrict notifications to specific Frigate zone names (leave empty for any zone).
+      default: []
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options: []
+
+    options:
+      name: Presence, Cooldown, Mute & Media Options
+      icon: mdi:tune
+      collapsed: true
+      input:
+        presence_filter:
+          name: (Optional) Suppress When Home
+          description: Skip alerts when any selected person, tracker, group, or toggle is `home` / `on`.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: [person, device_tracker, group, input_boolean]
+
+        custom_conditions:
+          name: (Optional) Extra Conditions
+          description: Extra conditions checked before alerting (e.g., time window or sun state).
+          default: []
+          selector:
+            condition: {}
+
+        cooldown:
+          name: Post-Event Cooldown
+          description: Quiet period after a review ends before this camera can alert again.
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 600
+              unit_of_measurement: seconds
+
+        silence_timer:
+          name: Mute Button Duration
+          description: How long to mute this camera when tapping the `Mute` notification button.
+          default: 30
+          selector:
+            number:
+              min: 1
+              max: 720
+              unit_of_measurement: minutes
+
+        end_animated_preview:
+          name: Animated GIF When Event Ends
+          description: Swap the static snapshot for Frigate's `review_preview.gif` once the event finishes.
+          default: true
+          selector:
+            boolean: {}
+
+mode: single
+max_exceeded: silent
+
+trigger_variables:
+  camera_entity: !input camera
+  camera_slug: "{{ camera_entity.split('.')[-1] }}"
+  mute_action: "{{ 'FRIGATE_MUTE_' ~ camera_slug }}"
+  unmute_action: "{{ 'FRIGATE_UNMUTE_' ~ camera_slug }}"
+
+triggers:
+  - id: review
+    trigger: mqtt
+    topic: frigate/reviews
+    payload: "match"
+    value_template: >-
+      {% set a = value_json.get('after', {}) %}
+      {% set b = value_json.get('before', {}) %}
+      {% set a_data = a.get('data', {}) %}
+      {% set b_data = b.get('data', {}) %}
+      {% set changed = value_json.get('type') in ['new', 'end']
+         or b.get('severity') != a.get('severity')
+         or b_data.get('objects') != a_data.get('objects')
+         or b_data.get('sub_labels') != a_data.get('sub_labels')
+         or b_data.get('zones') != a_data.get('zones')
+         or (not b_data.get('detections') and a_data.get('detections')) %}
+      {{ 'match' if (a.get('camera') == camera_slug and changed) else 'skip' }}
+
+  - id: mute
+    trigger: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: "{{ mute_action }}"
+
+variables:
+  raw_notify: !input notify_service
+  severity_mode: !input severity_filter
+  zone_only: !input zone_filter
+  filter_zones: !input zones
+  filter_labels: !input labels
+  presence_entities: !input presence_filter
+  cooldown_secs: !input cooldown
+  mute_minutes: !input silence_timer
+  use_gif: !input end_animated_preview
+
+  notify_action: "{{ raw_notify if '.' in raw_notify else 'notify.' ~ raw_notify }}"
+  camera_name: "{{ state_attr(camera_entity, 'friendly_name') or (camera_slug | replace('_', ' ') | title) }}"
+  anyone_home: "{{ expand(presence_entities) | selectattr('state', 'in', ['home', 'on']) | list | length > 0 }}"
+
+  # Safely unpack MQTT payload (defaults to empty dicts when triggered by the Mute button)
+  payload: "{{ trigger.payload_json if (trigger.id == 'review' and trigger.payload_json is defined) else {} }}"
+  ev_type: "{{ payload.get('type', '') }}"
+  is_ended: "{{ ev_type == 'end' }}"
+  after: "{{ payload.get('after') or {} }}"
+  before: "{{ payload.get('before') or {} }}"
+  after_data: "{{ after.get('data') or {} }}"
+  before_data: "{{ before.get('data') or {} }}"
+
+  review_id: "{{ after.get('id', '') }}"
+  detections: "{{ after_data.get('detections', []) }}"
+  first_det_id: "{{ detections[0] if detections else '' }}"
+  latest_det_id: "{{ detections[-1] if detections else '' }}"
+
+  objects: "{{ after_data.get('objects', []) | map('replace', '-verified', '') | unique | list }}"
+  prev_objects: "{{ before_data.get('objects', []) | map('replace', '-verified', '') | unique | list }}"
+  sub_labels: "{{ after_data.get('sub_labels', []) | unique | list }}"
+  zones: "{{ after_data.get('zones', []) }}"
+  prev_zones: "{{ before_data.get('zones', []) }}"
+  wanted_labels: "{{ filter_labels | map('lower') | list }}"
+  after_candidates: "{{ (objects + sub_labels) | map('lower') | list }}"
+  before_candidates: "{{ (prev_objects + before_data.get('sub_labels', [])) | map('lower') | list }}"
+
+  after_matches: >-
+    {{ trigger.id == 'review'
+       and (detections | length > 0)
+       and (severity_mode == 'all' or after.get('severity') == 'alert')
+       and (not zone_only or zones | length > 0)
+       and (not filter_zones or filter_zones | select('in', zones) | list | length > 0)
+       and (not wanted_labels or wanted_labels | select('in', after_candidates) | list | length > 0) }}
+
+  before_matches: >-
+    {{ ev_type != 'new'
+       and (before_data.get('detections', []) | length > 0)
+       and (severity_mode == 'all' or before.get('severity') == 'alert')
+       and (not zone_only or prev_zones | length > 0)
+       and (not filter_zones or filter_zones | select('in', prev_zones) | list | length > 0)
+       and (not wanted_labels or wanted_labels | select('in', before_candidates) | list | length > 0) }}
+
+  # Buzz once on the first matching frame; update silently in place on follow-ups
+  is_first_alert: "{{ after_matches and not before_matches }}"
+
+  objects_text: "{{ objects | map('replace', '_', ' ') | map('title') | join(', ') }}"
+  notif_title: "{{ objects_text }}{{ ' (' ~ (sub_labels | join(', ')) ~ ')' if sub_labels else '' }} • {{ camera_name }}"
+  notif_message: >-
+    Detected {{ objects_text | lower }}{{ ' in ' ~ (zones | map('replace', '_', ' ') | map('title') | join(', ')) if zones else '' }}{{ ' (clip ready)' if is_ended else '' }}.
+
+  icon_map:
+    person: mdi:account-alert
+    package: mdi:package-variant-closed-check
+    car: mdi:car-connected
+    dog: mdi:dog-side
+    cat: mdi:cat
+  notif_icon: "{{ 'mdi:account-alert' if 'person' in objects else (icon_map.get(objects[0], 'mdi:paw') if objects else 'mdi:cctv') }}"
+  notif_color: "{{ '#EF4444' if 'person' in objects else ('#F59E0B' if 'package' in objects else '#10B981') }}"
+
+  live_url: "entityId:{{ camera_entity }}"
+  snapshot_url: "/api/frigate/notifications/{{ latest_det_id }}/snapshot.jpg"
+  clip_url: "/api/frigate/notifications/{{ first_det_id }}/clip.mp4"
+  image_url: "{{ '/api/frigate/notifications/' ~ review_id ~ '/review_preview.gif' if (is_ended and use_gif) else snapshot_url }}"
+  mute_tag: "frigate_mute_{{ camera_slug }}"
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: trigger
+        id: mute
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: review
+          - condition: template
+            value_template: "{{ not anyone_home and (after_matches or (is_ended and before_matches)) }}"
+          - condition: and
+            conditions: !input custom_conditions
+
+actions:
+  # 1. Send or silently update the Frigate detection notification
+  - if:
+      - condition: trigger
+        id: review
+    then:
+      - action: "{{ notify_action }}"
+        data:
+          title: "{{ notif_title }}"
+          message: "{{ notif_message }}"
+          data:
+            tag: "frigate_{{ review_id }}"
+            channel: "Frigate: {{ camera_name }}"
+            group: "frigate_{{ camera_slug }}"
+            importance: "{{ 'high' if is_first_alert else 'default' }}"
+            priority: "{{ 'high' if is_first_alert else 'normal' }}"
+            ttl: 0
+            alert_once: "{{ not is_first_alert }}"
+            notification_icon: "{{ notif_icon }}"
+            color: "{{ notif_color }}"
+            clickAction: "{{ clip_url if is_ended else live_url }}"
+            url: "{{ clip_url if is_ended else live_url }}"
+            image: "{{ image_url }}"
+            attachment:
+              url: "{{ image_url }}"
+            push:
+              sound: "{{ 'default' if is_first_alert else 'none' }}"
+              interruption-level: "{{ 'time-sensitive' if is_first_alert else 'passive' }}"
+            actions:
+              - action: URI
+                title: "{{ 'View Clip' if is_ended else 'Live Camera' }}"
+                uri: "{{ clip_url if is_ended else live_url }}"
+              - action: URI
+                title: "Snapshot"
+                uri: "{{ snapshot_url }}"
+              - action: "{{ mute_action }}"
+                title: "Mute {{ mute_minutes | int }}m"
+                destructive: true
+
+      # Post-review cooldown (still listens for Mute taps during the cooldown window)
+      - if:
+          - condition: template
+            value_template: "{{ is_ended and (cooldown_secs | int) > 0 }}"
+        then:
+          - wait_for_trigger:
+              - trigger: event
+                event_type: mobile_app_notification_action
+                event_data:
+                  action: "{{ mute_action }}"
+            timeout:
+              seconds: "{{ cooldown_secs | int }}"
+            continue_on_timeout: true
+
+  # 2. Handle camera Mute (triggered directly OR tapped during post-review cooldown)
+  - if:
+      - condition: template
+        value_template: "{{ trigger.id == 'mute' or (wait is defined and wait.trigger is not none) }}"
+    then:
+      - action: "{{ notify_action }}"
+        data:
+          title: "🔇 {{ camera_name }} Muted ({{ mute_minutes | int }}m)"
+          message: "Frigate alerts paused for {{ mute_minutes | int }} minutes."
+          data:
+            tag: "{{ mute_tag }}"
+            channel: "Frigate: {{ camera_name }}"
+            group: "frigate_{{ camera_slug }}"
+            alert_once: true
+            chronometer: true
+            when: "{{ (mute_minutes | int) * 60 }}"
+            when_relative: true
+            notification_icon: "mdi:bell-off-outline"
+            color: "#6B7280"
+            push:
+              sound: "none"
+              interruption-level: "passive"
+            actions:
+              - action: "{{ unmute_action }}"
+                title: "Unsilence Now"
+      - wait_for_trigger:
+          - trigger: event
+            event_type: mobile_app_notification_action
+            event_data:
+              action: "{{ unmute_action }}"
+        timeout:
+          minutes: "{{ mute_minutes | int }}"
+        continue_on_timeout: true
+      - action: "{{ notify_action }}"
+        data:
+          message: "clear_notification"
+          data:
+            tag: "{{ mute_tag }}"
