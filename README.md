@@ -17,11 +17,11 @@ Minimal, readable, zero-spaghetti **Home Assistant** automation blueprints built
 A clean, readable replacement for legacy `frigate/events` Gists and 3,000-line Jinja monoliths:
 
 - **Native `frigate/reviews` Clustering:** Groups overlapping detections (e.g., `person` + `dog`) into a single review thread instead of firing separate alerts per bounding box.
-- **Stateless In-Place Updates (No Stuck `wait_for_trigger` Event Loops):** Diffs `before` vs. `after` so `new` and `update` frames finish cleanly—buzzing once on the first matching frame and silently updating in place (`alert_once: true` on Android, `passive` / `sound: none` on iOS) as objects, zones, or `-verified` sub-labels evolve.
+- **In-Place Per-Camera Replacement (`frigate_<camera>`):** Updates and the final `(clip ready)` notification replace the existing camera notification in place (`alert_once: true` on Android, `passive` / `sound: none` on iOS) instead of piling up separate cards per review segment.
 - **Zero-Proxy-Hop MQTT RAM Snapshots (`image.<camera>_<object>`):** Serves inline notification previews directly out of Home Assistant's RAM (`/api/image_proxy/image.<camera>_<object>?token=...` populated over MQTT), avoiding reverse-proxy `X-Forwarded-For` `403` blocks on internal Frigate vhosts and gracefully falling back to `/api/frigate/<client_id>/snapshot/<id>?bbox=1`.
-- **Fullscreen Views + Native Android Video Player (`intent://`):**
+- **Fullscreen Views + Direct HTTPS Clip Playback:**
   - **`Fullscreen Camera / Frigate View Path`:** Replaces Home Assistant's small bottom-sheet `entityId:` popup with your full-screen Frigate Ingress panel (`/ccab4aaf_frigate-proxy`) or Lovelace Advanced Camera Card tab (`/lovelace/cameras`).
-  - **`External HA URL for Native Fullscreen Clip Player`:** Launches `clip.mp4` directly in Android's native fullscreen video player (`intent://`, autoplay + pinch-to-zoom) without hitting Android Companion App's `FrontendScreen` `?external_auth=1` WebView bug (`home-assistant/android#7380`) or `UrlUtil.handle` `%2F` path-splitting bug.
+  - **`External HA URL for Direct Clip Playback`:** Opens `clip.mp4` (`Play Clip`) directly in Android/iOS's fullscreen HTML5 video player via an absolute `https://` URL—working on stock Google Pixel without third-party `intent://` apps and bypassing Android Companion App's `FrontendScreen` `?external_auth=1` WebView bug (`home-assistant/android#7380`) and `UrlUtil.handle` `%2F` path-splitting bug.
 - **Anytime Mute + Live Countdown:** Tapping **`Mute`** works at any point, displays a swipeable countdown pill (`chronometer: true`), and includes a 1-tap **`Unsilence Now`** button.
 
 #### Prerequisites

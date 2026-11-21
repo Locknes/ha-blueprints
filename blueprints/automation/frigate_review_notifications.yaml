@@ -5,8 +5,9 @@ blueprint:
     Groups overlapping detections into one thread, updates silently in place without stuck
     `wait_for_trigger` loops, serves instant MQTT-backed snapshots straight from Home Assistant
     RAM (`image.<camera>_<object>`, immune to reverse-proxy `X-Forwarded-For` `403` blocks),
-    supports fullscreen Frigate/dashboard views + native Android `intent://` clip playback,
-    and includes anytime camera muting with a live countdown.
+    replaces each camera's notification in place when the clip is ready, supports fullscreen
+    Frigate/dashboard views + direct HTTPS `clip.mp4` playback, and includes anytime camera
+    muting with a live countdown.
   domain: automation
   author: Locknes
   source_url: https://github.com/Locknes/ha-blueprints/blob/main/blueprints/automation/frigate_review_notifications.yaml
@@ -41,10 +42,10 @@ blueprint:
         text: {}
 
     direct_clip_base_url:
-      name: (Optional) External HA URL for Native Fullscreen Clip Player
+      name: (Optional) External HA URL for Direct Clip Playback
       description: >-
-        Set your external HTTPS URL (e.g., `https://ha.example.com`) to launch `clip.mp4` directly in
-        Android's native fullscreen video player (`intent://`, autoplay + pinch-to-zoom). Leave blank
+        Set your external HTTPS URL (e.g., `https://ha.example.com`) so `Play Clip` opens the exact
+        `clip.mp4` outside the HA WebView (avoiding Android `?external_auth=1` errors). Leave blank
         to open your Fullscreen Camera/Frigate path (or `/media-browser/browser`) inside the app.
       default: ""
       selector:
@@ -154,6 +155,15 @@ blueprint:
           selector:
             boolean: {}
 
+        replace_notification:
+          name: Replace Existing Camera Notification
+          description: >-
+            Use a single per-camera tag (`frigate_<camera>`) so updates and the final clip-ready
+            notification always replace the existing notification in place instead of stacking.
+          default: true
+          selector:
+            boolean: {}
+
 mode: single
 max_exceeded: silent
 
@@ -197,6 +207,7 @@ variables:
   cooldown_secs: !input cooldown
   mute_minutes: !input silence_timer
   use_gif: !input end_animated_preview
+  replace_existing: !input replace_notification
 
   notify_action: "{{ raw_notify if '.' in raw_notify else 'notify.' ~ raw_notify }}"
   camera_name: "{{ state_attr(camera_entity, 'friendly_name') or (camera_slug | replace('_', ' ') | title) }}"
@@ -212,8 +223,9 @@ variables:
   before_data: "{{ before.get('data') or {} }}"
   frigate_camera: "{{ after.get('camera') or state_attr(camera_entity, 'camera_name') or camera_slug }}"
 
-  review_id: "{{ after.get('id', '') }}"
-  detections: "{{ after_data.get('detections', []) }}"
+  review_id: "{{ after.get('id') or before.get('id') or camera_slug }}"
+  # Frigate's ReviewSegment builds `detections` from a Python `set`; sort so [0] is earliest and [-1] is latest
+  detections: "{{ (after_data.get('detections') or before_data.get('detections') or []) | sort }}"
   first_det_id: "{{ detections[0] if detections else '' }}"
   latest_det_id: "{{ detections[-1] if detections else '' }}"
 
@@ -264,15 +276,13 @@ variables:
   live_url: "{{ dashboard_path if dashboard_path else ('entityId:' ~ camera_entity) }}"
   clips_browser_url: "{{ dashboard_path if dashboard_path else '/media-browser/browser' }}"
   clean_base: "{{ (raw_base_url | trim).rstrip('/') }}"
-  base_scheme: "{{ 'http' if clean_base.startswith('http://') else 'https' }}"
-  base_host: "{{ clean_base | replace('https://', '') | replace('http://', '') }}"
+  has_direct_clip: "{{ (clean_base | length > 0) and (first_det_id | length > 0) }}"
   clip_path: "{{ frigate_api ~ '/notifications/' ~ first_det_id ~ '/clip.mp4' }}"
-  clip_action_title: "{{ 'Play Clip' if base_host else 'Frigate / Clips' }}"
-  android_clip_url: >-
-    {{ ('intent://' ~ base_host ~ clip_path ~ '#Intent;scheme=' ~ base_scheme ~ ';action=android.intent.action.VIEW;type=video/mp4;end')
-       if base_host else clips_browser_url }}
-  ios_clip_url: "{{ (clean_base ~ clip_path) if base_host else clips_browser_url }}"
+  clip_action_title: "{{ 'Play Clip' if has_direct_clip else 'Frigate / Clips' }}"
+  clip_url: "{{ (clean_base ~ clip_path) if has_direct_clip else clips_browser_url }}"
 
+  notif_tag: "{{ ('frigate_' ~ camera_slug) if replace_existing else ('frigate_' ~ review_id) }}"
+  notif_group: "{{ '' if replace_existing else ('frigate_' ~ camera_slug) }}"
   primary_obj: "{{ objects[0] if objects else 'person' }}"
   fallback_snapshot_url: "{{ frigate_api }}/snapshot/{{ latest_det_id }}?bbox=1"
   gif_url: "{{ frigate_api }}/notifications/{{ review_id }}/review_preview.gif"
@@ -312,9 +322,9 @@ actions:
           title: "🧪 Test Alert • {{ camera_name }}"
           message: "Test notification for {{ camera_name }}."
           data:
-            tag: "frigate_test_{{ camera_slug }}"
+            tag: "{{ ('frigate_' ~ camera_slug) if replace_existing else ('frigate_test_' ~ camera_slug) }}"
             channel: "Frigate: {{ camera_name }}"
-            group: "frigate_{{ camera_slug }}"
+            group: "{{ notif_group }}"
             importance: high
             priority: high
             ttl: 0
@@ -374,17 +384,17 @@ actions:
           title: "{{ notif_title }}"
           message: "{{ notif_message }}"
           data:
-            tag: "frigate_{{ review_id }}"
+            tag: "{{ notif_tag }}"
             channel: "Frigate: {{ camera_name }}"
-            group: "frigate_{{ camera_slug }}"
+            group: "{{ notif_group }}"
             importance: "{{ 'high' if is_first_alert else 'default' }}"
             priority: "{{ 'high' if is_first_alert else 'normal' }}"
             ttl: 0
             alert_once: "{{ not is_first_alert }}"
             notification_icon: "{{ notif_icon }}"
             color: "{{ notif_color }}"
-            clickAction: "{{ android_clip_url if is_ended else live_url }}"
-            url: "{{ ios_clip_url if is_ended else live_url }}"
+            clickAction: "{{ clip_url if is_ended else live_url }}"
+            url: "{{ clip_url if is_ended else live_url }}"
             image: "{{ image_url }}"
             attachment:
               url: "{{ image_url }}"
@@ -394,10 +404,10 @@ actions:
             actions:
               - action: URI
                 title: "{{ clip_action_title if is_ended else 'Live Camera' }}"
-                uri: "{{ android_clip_url if is_ended else live_url }}"
+                uri: "{{ clip_url if is_ended else live_url }}"
               - action: URI
-                title: "{{ 'Live Camera' if is_ended else 'Frigate / Clips' }}"
-                uri: "{{ live_url if is_ended else clips_browser_url }}"
+                title: "{{ 'Live Camera' if is_ended else clip_action_title }}"
+                uri: "{{ live_url if is_ended else clip_url }}"
               - action: "{{ mute_action }}"
                 title: "Mute {{ mute_minutes | int }}m"
                 destructive: true
