@@ -262,31 +262,68 @@ class TestFrigateReviewBlueprint(unittest.TestCase):
         )
         self.assertFalse(res["_mqtt_matched"])
 
-    def test_optional_direct_native_player_intent_and_animated_gif(self) -> None:
+    def test_optional_direct_https_clip_playback_and_animated_gif(self) -> None:
         state = {
             "id": "rev-1",
             "camera": "backyard",
             "severity": "alert",
-            "data": {"detections": ["det-1"], "objects": ["person"], "sub_labels": [], "zones": []},
+            # Unordered Python set output from Frigate ReviewSegment.get_data()
+            "data": {"detections": ["1795293500.0-det2", "1795293100.0-det1"], "objects": ["person"], "sub_labels": [], "zones": []},
         }
+        active = self._simulate(
+            {"id": "review", "platform": "mqtt", "payload_json": {"type": "new", "before": state, "after": state}},
+            user_inputs={"direct_clip_base_url": "https://ha.example.com/"},
+        )
+        # During active alert, Button 2 already offers direct Play Clip using chronological first detection
+        self.assertEqual(active["_rendered_notify"]["data"]["tag"], "frigate_backyard")
+        self.assertEqual(active["_rendered_notify"]["data"]["group"], "")
+        self.assertEqual(active["_rendered_notify"]["data"]["actions"][1]["title"], "Play Clip")
+        self.assertEqual(
+            active["_rendered_notify"]["data"]["actions"][1]["uri"],
+            "https://ha.example.com/api/frigate/frigate/notifications/1795293100.0-det1/clip.mp4",
+        )
+
         end = self._simulate(
             {"id": "review", "platform": "mqtt", "payload_json": {"type": "end", "before": state, "after": state}},
             user_inputs={"direct_clip_base_url": "https://ha.example.com/", "end_animated_preview": True},
         )
         self.assertTrue(end["_gif_delay_runs"])
+        # Same tag replaces the existing camera notification in place silently
+        self.assertEqual(end["_rendered_notify"]["data"]["tag"], "frigate_backyard")
+        self.assertTrue(end["_rendered_notify"]["data"]["alert_once"])
         self.assertEqual(
             end["_rendered_notify"]["data"]["image"],
             "/api/frigate/frigate/notifications/rev-1/review_preview.gif",
         )
         self.assertEqual(
             end["_rendered_notify"]["data"]["clickAction"],
-            "https://ha.example.com/api/frigate/frigate/notifications/det-1/clip.mp4",
+            "https://ha.example.com/api/frigate/frigate/notifications/1795293100.0-det1/clip.mp4",
         )
         self.assertEqual(
             end["_rendered_notify"]["data"]["url"],
-            "https://ha.example.com/api/frigate/frigate/notifications/det-1/clip.mp4",
+            "https://ha.example.com/api/frigate/frigate/notifications/1795293100.0-det1/clip.mp4",
         )
         self.assertEqual(end["_rendered_notify"]["data"]["actions"][0]["title"], "Play Clip")
+        self.assertEqual(
+            end["_rendered_notify"]["data"]["actions"][0]["uri"],
+            "https://ha.example.com/api/frigate/frigate/notifications/1795293100.0-det1/clip.mp4",
+        )
+        # Fallback snapshot uses chronological latest detection
+        self.assertEqual(end["fallback_snapshot_url"], "/api/frigate/frigate/snapshot/1795293500.0-det2?bbox=1")
+
+    def test_replace_notification_disabled_uses_per_review_tag(self) -> None:
+        state = {
+            "id": "rev-42",
+            "camera": "backyard",
+            "severity": "alert",
+            "data": {"detections": ["det-1"], "objects": ["person"], "sub_labels": [], "zones": []},
+        }
+        res = self._simulate(
+            {"id": "review", "platform": "mqtt", "payload_json": {"type": "new", "before": state, "after": state}},
+            user_inputs={"replace_notification": False},
+        )
+        self.assertEqual(res["_rendered_notify"]["data"]["tag"], "frigate_rev-42")
+        self.assertEqual(res["_rendered_notify"]["data"]["group"], "frigate_backyard")
 
     def test_presence_suppression_still_allows_matching_mute_button_only(self) -> None:
         state = {
